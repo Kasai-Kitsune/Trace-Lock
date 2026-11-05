@@ -1,0 +1,402 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>Trace Lock</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+      -webkit-tap-highlight-color: transparent;
+      -webkit-touch-callout: none;
+    }
+
+    html, body {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #111;
+      position: fixed;
+      touch-action: none;
+      overscroll-behavior: none;
+    }
+
+    #uploader {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 1.2rem;
+      background: #111;
+      color: #eee;
+      font-family: system-ui, -apple-system, sans-serif;
+      z-index: 10;
+    }
+
+    #uploader.hidden {
+      display: none;
+    }
+
+    #uploader label {
+      background: #2a2a2a;
+      border: 1px solid #444;
+      padding: 0.9rem 1.6rem;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 1rem;
+      user-select: none;
+    }
+
+    #uploader label:active {
+      background: #333;
+    }
+
+    #file-input {
+      display: none;
+    }
+
+    #hint {
+      font-size: 0.85rem;
+      color: #888;
+      text-align: center;
+      max-width: 280px;
+      line-height: 1.4;
+    }
+
+    #viewer {
+      position: fixed;
+      inset: 0;
+      display: none;
+      background: #000;
+      z-index: 1;
+    }
+
+    #viewer.active {
+      display: block;
+    }
+
+    /* The image always fits whatever space the viewer has, so entering or
+       leaving fullscreen re-fits it with the proportions untouched. */
+    #viewer img {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      object-position: center;
+      pointer-events: none;
+      user-select: none;
+      -webkit-user-drag: none;
+    }
+
+    /* Hold-to-activate buttons, only visible when an image is loaded */
+    .hold {
+      position: fixed;
+      right: max(1.2rem, env(safe-area-inset-right));
+      z-index: 20;
+      display: none;
+    }
+
+    .hold.visible {
+      display: block;
+    }
+
+    #fs-wrap {
+      top: max(1.2rem, env(safe-area-inset-top));
+    }
+
+    #unlock-wrap {
+      bottom: max(1.2rem, env(safe-area-inset-bottom));
+    }
+
+    .hold.unsupported {
+      display: none !important;
+    }
+
+    .hold button {
+      position: relative;
+      display: block;
+      background: rgba(30, 30, 30, 0.75);
+      color: #ddd;
+      border: none;
+      border-radius: 10px;
+      padding: 0.6rem 1rem;
+      font-size: 0.8rem;
+      font-family: system-ui, sans-serif;
+      cursor: pointer;
+      backdrop-filter: blur(4px);
+      user-select: none;
+      -webkit-user-select: none;
+      touch-action: none;
+    }
+
+    .hold.holding button {
+      background: rgba(50, 50, 50, 0.9);
+    }
+
+    /* Ring wrapped around the button: dim track plus a progress arc */
+    .ring {
+      position: absolute;
+      left: -5px;
+      top: -5px;
+      pointer-events: none;
+      overflow: visible;
+    }
+
+    .ring rect {
+      fill: none;
+      stroke-width: 3px;
+    }
+
+    .ring .track {
+      stroke: #4a6a9c;
+    }
+
+    .ring .progress {
+      stroke: #ffa726;
+      stroke-linecap: round;
+      stroke-dasharray: 100;
+      stroke-dashoffset: 100;
+    }
+
+    .hold.done .ring .progress {
+      stroke: #43c463;
+    }
+  </style>
+</head>
+<body>
+  <div id="uploader">
+    <label for="file-input">Choose Photo</label>
+    <input type="file" id="file-input" accept="image/*">
+    <p id="hint">Image will fill the screen while keeping its proportions. Screen is locked against scroll and zoom, and stays awake for tracing.</p>
+  </div>
+
+  <div id="viewer">
+    <img id="preview" alt="Locked reference">
+  </div>
+
+  <div class="hold" id="fs-wrap">
+    <button id="fullscreen" type="button">Fullscreen</button>
+    <svg class="ring" aria-hidden="true">
+      <rect class="track" pathLength="100"></rect>
+      <rect class="progress" pathLength="100"></rect>
+    </svg>
+  </div>
+
+  <div class="hold" id="unlock-wrap">
+    <button id="unlock" type="button">Change / Unlock</button>
+    <svg class="ring" aria-hidden="true">
+      <rect class="track" pathLength="100"></rect>
+      <rect class="progress" pathLength="100"></rect>
+    </svg>
+  </div>
+
+  <script>
+    const fileInput = document.getElementById('file-input');
+    const uploader  = document.getElementById('uploader');
+    const viewer    = document.getElementById('viewer');
+    const preview   = document.getElementById('preview');
+    const fsWrap    = document.getElementById('fs-wrap');
+    const unlockWrap = document.getElementById('unlock-wrap');
+    const unlockBtn = document.getElementById('unlock');
+    const fsBtn     = document.getElementById('fullscreen');
+
+    const HOLD_MS = 3000;
+
+    // Prevent accidental scrolling / rubber-banding
+    document.addEventListener('touchmove', e => e.preventDefault(), { passive: false });
+    document.addEventListener('gesturestart', e => e.preventDefault());
+    document.addEventListener('gesturechange', e => e.preventDefault());
+    document.addEventListener('contextmenu', e => e.preventDefault());
+
+    // ---------- Hold-to-activate with a progress ring ----------
+    // onComplete may return a Promise. If it rejects (for example the browser
+    // wants a fresh tap before allowing fullscreen), the action is retried on release.
+    function makeHold(wrap, button, onComplete) {
+      const arc = wrap.querySelector('.progress');
+      const svg = wrap.querySelector('.ring');
+
+      // Size the ring rectangles to hug the button (set in JS for wide browser support)
+      function layoutRing() {
+        const w = button.offsetWidth;
+        const h = button.offsetHeight;
+        if (!w || !h) return;
+        svg.setAttribute('width', w + 10);
+        svg.setAttribute('height', h + 10);
+        svg.querySelectorAll('rect').forEach(r => {
+          r.setAttribute('x', 2.5);
+          r.setAttribute('y', 2.5);
+          r.setAttribute('width', w + 5);
+          r.setAttribute('height', h + 5);
+          r.setAttribute('rx', 13);
+          r.setAttribute('ry', 13);
+        });
+      }
+      new ResizeObserver(layoutRing).observe(button);
+      layoutRing();
+
+      let startTime = 0;
+      let raf = 0;
+      let activePointer = null;
+      let completed = false;
+      let retryOnRelease = false;
+
+      function setProgress(p) {
+        arc.style.strokeDashoffset = String(100 - p * 100);
+      }
+
+      function resetRing() {
+        cancelAnimationFrame(raf);
+        wrap.classList.remove('holding', 'done');
+        // quick unwind so it visibly drains back
+        arc.style.transition = 'stroke-dashoffset 0.2s ease-out';
+        setProgress(0);
+        setTimeout(() => { arc.style.transition = 'none'; }, 220);
+      }
+
+      function tick(now) {
+        const p = Math.min((now - startTime) / HOLD_MS, 1);
+        setProgress(p);
+        if (p >= 1) {
+          completed = true;
+          wrap.classList.add('done');
+          if (navigator.vibrate) navigator.vibrate(40);
+          let result;
+          try { result = onComplete(); } catch (e) { result = Promise.reject(e); }
+          if (result && typeof result.catch === 'function') {
+            result.catch(() => { retryOnRelease = true; });
+          }
+          return;
+        }
+        raf = requestAnimationFrame(tick);
+      }
+
+      button.addEventListener('pointerdown', e => {
+        if (activePointer !== null) return;
+        activePointer = e.pointerId;
+        completed = false;
+        retryOnRelease = false;
+        try { button.setPointerCapture(e.pointerId); } catch (err) {}
+        arc.style.transition = 'none';
+        setProgress(0);
+        wrap.classList.add('holding');
+        startTime = performance.now();
+        raf = requestAnimationFrame(tick);
+      });
+
+      function end(e) {
+        if (e.pointerId !== activePointer) return;
+        activePointer = null;
+        if (completed && retryOnRelease && e.type === 'pointerup') {
+          try { onComplete(); } catch (err) {}
+        }
+        resetRing();
+      }
+
+      button.addEventListener('pointerup', end);
+      button.addEventListener('pointercancel', end);
+      button.addEventListener('lostpointercapture', end);
+    }
+
+    // ---------- Wake lock (keeps the screen on while tracing) ----------
+    let wakeLock = null;
+    let wantWakeLock = false;
+
+    async function acquireWakeLock() {
+      if (!('wakeLock' in navigator) || wakeLock) return;
+      try {
+        wakeLock = await navigator.wakeLock.request('screen');
+        wakeLock.addEventListener('release', () => { wakeLock = null; });
+      } catch (err) {
+        wakeLock = null; // denied or unsupported, fail quietly
+      }
+    }
+
+    function releaseWakeLock() {
+      if (wakeLock) {
+        wakeLock.release().catch(() => {});
+        wakeLock = null;
+      }
+    }
+
+    // The browser drops the lock when the tab is hidden, so ask again on return
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible' && wantWakeLock) acquireWakeLock();
+    });
+
+    // ---------- Fullscreen ----------
+    const root = document.documentElement;
+    const canFullscreen = !!(root.requestFullscreen || root.webkitRequestFullscreen);
+
+    function isFullscreen() {
+      return !!(document.fullscreenElement || document.webkitFullscreenElement);
+    }
+
+    function updateFsLabel() {
+      fsBtn.textContent = isFullscreen() ? 'Exit Fullscreen' : 'Fullscreen';
+    }
+
+    if (!canFullscreen) {
+      // iPhone Safari has no fullscreen for pages, so the button hides itself.
+      // Use Share > Add to Home Screen to get a bar-free version instead.
+      fsWrap.classList.add('unsupported');
+    }
+
+    function toggleFullscreen() {
+      if (isFullscreen()) {
+        const exit = document.exitFullscreen || document.webkitExitFullscreen;
+        return Promise.resolve(exit.call(document));
+      }
+      const req = root.requestFullscreen || root.webkitRequestFullscreen;
+      return Promise.resolve(req.call(root, { navigationUI: 'hide' }));
+    }
+
+    document.addEventListener('fullscreenchange', updateFsLabel);
+    document.addEventListener('webkitfullscreenchange', updateFsLabel);
+
+    // ---------- Image handling ----------
+    function showControls(on) {
+      fsWrap.classList.toggle('visible', on);
+      unlockWrap.classList.toggle('visible', on);
+    }
+
+    function unlock() {
+      preview.src = '';
+      fileInput.value = '';
+      viewer.classList.remove('active');
+      showControls(false);
+      uploader.classList.remove('hidden');
+      wantWakeLock = false;
+      releaseWakeLock();
+    }
+
+    makeHold(fsWrap, fsBtn, toggleFullscreen);
+    makeHold(unlockWrap, unlockBtn, () => { unlock(); return Promise.resolve(); });
+
+    fileInput.addEventListener('change', () => {
+      const file = fileInput.files[0];
+      if (!file) return;
+
+      const url = URL.createObjectURL(file);
+      preview.src = url;
+
+      preview.onload = () => {
+        uploader.classList.add('hidden');
+        viewer.classList.add('active');
+        showControls(true);
+        wantWakeLock = true;
+        acquireWakeLock();
+        // Lock orientation if possible (mainly mobile)
+        if (screen.orientation && screen.orientation.lock) {
+          screen.orientation.lock(screen.orientation.type).catch(() => {});
+        }
+      };
+    });
+  </script>
+</body>
+</html>
